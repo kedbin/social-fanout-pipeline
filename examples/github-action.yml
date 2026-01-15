@@ -1,0 +1,112 @@
+# Example GitHub Actions Workflow for Social Fan-Out
+#
+# This workflow triggers on push to content directories,
+# authenticates via Workload Identity Federation, and
+# publishes to Google Cloud Pub/Sub.
+#
+# Required GitHub Secrets:
+# - GCP_PROJECT_ID: Your Google Cloud project ID
+# - GCP_WORKLOAD_IDENTITY_PROVIDER: Full provider resource name
+# - GCP_SERVICE_ACCOUNT: Service account email
+
+name: Social Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'content/**/*.md'
+
+# Required for Workload Identity Federation
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need previous commit to detect changes
+
+      - name: Detect changed files
+        id: changes
+        run: |
+          # Find changed markdown files in content directory
+          CHANGED=$(git diff --name-only HEAD~1 HEAD -- 'content/**/*.md' | head -1)
+          if [ -z "$CHANGED" ]; then
+            echo "No content changes detected"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "Changed file: $CHANGED"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "file=$CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Extract frontmatter
+        if: steps.changes.outputs.has_changes == 'true'
+        id: frontmatter
+        run: |
+          FILE="${{ steps.changes.outputs.file }}"
+          
+          # Check if publish_social is true in frontmatter
+          if ! grep -q "publish_social: true" "$FILE"; then
+            echo "publish_social not enabled, skipping"
+            echo "should_publish=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "should_publish=true" >> $GITHUB_OUTPUT
+          
+          # Extract platform-specific content from frontmatter
+          # Assumes frontmatter has linkedin_content and threads_content fields
+          LINKEDIN=$(sed -n '/^linkedin_content:/,/^[a-z]/p' "$FILE" | head -n -1 | tail -n +2)
+          THREADS=$(sed -n '/^threads_content:/,/^[a-z]/p' "$FILE" | head -n -1 | tail -n +2)
+          
+          # If no platform-specific content, use main content
+          if [ -z "$LINKEDIN" ]; then
+            LINKEDIN=$(sed '1,/^---$/d' "$FILE" | sed '/^---$/,$d')
+          fi
+          if [ -z "$THREADS" ]; then
+            THREADS=$(sed '1,/^---$/d' "$FILE" | sed '/^---$/,$d')
+          fi
+          
+          # Save to files for next step (avoids quoting issues)
+          echo "$LINKEDIN" > /tmp/linkedin_content.txt
+          echo "$THREADS" > /tmp/threads_content.txt
+
+      - name: Authenticate to Google Cloud
+        if: steps.frontmatter.outputs.should_publish == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.frontmatter.outputs.should_publish == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Publish to Pub/Sub
+        if: steps.frontmatter.outputs.should_publish == 'true'
+        run: |
+          # Build JSON payload
+          LINKEDIN_CONTENT=$(cat /tmp/linkedin_content.txt)
+          THREADS_CONTENT=$(cat /tmp/threads_content.txt)
+          
+          PAYLOAD=$(jq -n \
+            --arg linkedin "$LINKEDIN_CONTENT" \
+            --arg threads "$THREADS_CONTENT" \
+            '{
+              linkedin_content: $linkedin,
+              threads_content: $threads
+            }')
+          
+          # Publish to Pub/Sub topic
+          echo "$PAYLOAD" | gcloud pubsub topics publish social-publish-events \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --message="$(cat -)"
+          
+          echo "Published to Pub/Sub successfully"
